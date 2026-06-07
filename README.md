@@ -1,4 +1,3 @@
-```markdown
 # LynShred 1.0.0
 
 **LynShred** 是一款简单、安全的文件彻底删除工具。  
