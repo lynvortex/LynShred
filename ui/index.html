@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LynShred</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="toolbar">
+        <button id="btn-add-files">添加文件</button>
+        <button id="btn-add-folder">添加文件夹</button>
+        <span class="sep"></span>
+        <button id="btn-remove">移除选中</button>
+        <button id="btn-clear">清空列表</button>
+    </div>
+
+    <div id="file-list">
+        <div class="empty-hint" id="empty-hint">
+            <svg width="45" height="55" viewBox="0 0 45 55" fill="none" style="display:block;margin:0 auto 12px auto;opacity:0.5">
+                <path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>
+                <path d="M33 0V12H45Z" fill="#828282"/>
+            </svg>
+            <span>将文件拖放至此</span>
+        </div>
+    </div>
+
+    <div id="bottom-bar">
+        <div id="method-area">
+            <label>擦除算法：</label>
+            <select id="method-select"></select>
+        </div>
+        <button id="btn-shred" class="danger">开始处理</button>
+    </div>
+
+    <div id="status-bar">©绘萤者 开源地址:https://github.com/lynvortex/lynshred</div>
+
+    <!-- 进度对话框 -->
+    <div id="overlay" class="hidden"></div>
+    <div id="progress-dialog" class="hidden">
+        <div id="progress-title">处理中</div>
+        <div id="progress-label">正在处理文件，请稍候...</div>
+        <div id="progress-bar-bg">
+            <div id="progress-bar-fill"></div>
+        </div>
+        <div id="progress-btn-area">
+            <button id="btn-cancel-progress">取消</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
