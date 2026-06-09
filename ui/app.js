@@ -234,74 +234,41 @@ function bindTauriEvents() {
 }
 
 // ───────────────── Drag & Drop ─────────────────
-document.addEventListener('dragenter', (e) => { e.preventDefault(); });
-document.addEventListener('dragleave', (e) => { e.preventDefault(); });
-document.addEventListener('dragover', (e) => { e.preventDefault(); });
+// HTML5 dragover 使 drop 光标出现，同时提供视觉反馈
+const fileList = $('file-list');
+fileList.addEventListener('dragover', (e) => { e.preventDefault(); fileList.classList.add('drag-over'); });
+fileList.addEventListener('dragleave', () => { fileList.classList.remove('drag-over'); });
+fileList.addEventListener('drop', (e) => { e.preventDefault(); });
 
-document.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    const items = e.dataTransfer.items;
-    if (!items || items.length === 0) return;
-
-    const filePaths = [];
-    const folderPaths = [];
-
-    // Use FileSystemEntry API to distinguish files from folders
-    for (let i = 0; i < items.length; i++) {
-        const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
-        if (!entry) {
-            // Fallback: just get the path
-            const f = items[i].getAsFile();
-            if (f && f.path) filePaths.push(f.path);
-            continue;
-        }
-        if (entry.isDirectory) {
-            folderPaths.push(entry.fullPath);
-        } else if (entry.isFile) {
-            if (entry.fullPath) {
-                // webkitGetAsEntry returns fullPath starting with /
-                const f = items[i].getAsFile();
-                if (f && f.path) filePaths.push(f.path);
-            }
-        }
-    }
-
-    if (filePaths.length === 0 && folderPaths.length === 0) return;
-
-    let totalAdded = 0;
-
-    try {
-        if (filePaths.length > 0) {
-            const added = await invoke('add_files', { files: filePaths });
-            state.filePaths.push(...added);
-            totalAdded += added.length;
-        }
-    } catch (e) {}
-
-    try {
-        if (folderPaths.length > 0) {
-            // For each folder path, we need its real filesystem path, not virtual path
-            // webkitGetAsEntry gives us virtual paths, so let's use the dataTransfer files instead
-            const allPaths = [];
-            for (const f of e.dataTransfer.files) {
-                if (f.path) allPaths.push(f.path);
-            }
-            // Check if any are directories by trying folder add
-            for (const p of allPaths) {
-                try {
-                    const added = await invoke('add_folder', { folder: p });
+// 用 Tauri Window API 获取真实文件路径
+if (window.__TAURI__ && window.__TAURI__.window) {
+    window.__TAURI__.window.getCurrent().onFileDropEvent(async (evt) => {
+        const p = evt.payload;
+        try {
+            if (p.type === 'hover') {
+                fileList.classList.add('drag-over');
+            } else if (p.type === 'drop') {
+                fileList.classList.remove('drag-over');
+                const paths = p.paths;
+                if (!paths || paths.length === 0) return;
+                setStatus(`正在添加 ${paths.length} 个项目...`);
+                const added = await invoke('add_dropped_paths', { paths });
+                if (added && added.length > 0) {
                     state.filePaths.push(...added);
-                    totalAdded += added.length;
-                } catch (e2) {}
+                    renderList();
+                    setStatus(`已添加 ${added.length} 个文件`);
+                } else {
+                    setStatus('没有可添加的文件');
+                }
+            } else {
+                fileList.classList.remove('drag-over');
             }
+        } catch (e) {
+            fileList.classList.remove('drag-over');
+            await tauriMessage(String(e), { title: '错误', type: 'error' });
         }
-    } catch (e) {}
-
-    if (totalAdded > 0) {
-        renderList();
-        setStatus(`已添加 ${totalAdded} 个文件`);
-    }
-});
+    });
+}
 
 // ───────────────── Init ─────────────────
 async function init() {

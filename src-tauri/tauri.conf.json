@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "LynShred",
-    "version": "2.0.0"
+    "version": "2.1.1"
   },
   "tauri": {
     "allowlist": {
@@ -55,7 +55,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LynShred 2.0.0",
+        "title": "LynShred 2.1.1",
         "width": 650,
         "height": 550,
         "minWidth": 550,

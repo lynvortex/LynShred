@@ -63,6 +63,7 @@ button.danger:hover:not(:disabled) { background: #fde0e0; }
     font-family: Consolas, 'Courier New', monospace;
     color: #333;
 }
+#file-list.drag-over { background: #e8f5e9; outline: 3px dashed #4caf50; outline-offset: -3px; }
 .empty-hint {
     position: absolute;
     top: 50%;

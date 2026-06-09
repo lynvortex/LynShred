@@ -125,6 +125,33 @@ pub fn add_folder(state: State<AppState>, folder: String) -> Result<Vec<String>,
     catch("add_folder", || add_folder_inner(&mut guard, &folder))
 }
 
+/// 拖放添加：自动判断路径是文件还是文件夹，批量添加到列表
+#[tauri::command]
+pub fn add_dropped_paths(
+    state: State<AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut guard = state.file_paths.lock().map_err(|e| e.to_string())?;
+    catch("add_dropped_paths", || {
+        let mut all_added: Vec<String> = Vec::new();
+        for p in &paths {
+            let path = std::path::Path::new(p);
+            if path.is_dir() {
+                match add_folder_inner(&mut guard, p) {
+                    Ok(added) => all_added.extend(added),
+                    Err(e) => eprintln!("[LynShred] add_folder falló: {}", e),
+                }
+            } else if path.is_file() {
+                match add_files_inner(&mut guard, &[p.clone()]) {
+                    Ok(added) => all_added.extend(added),
+                    Err(e) => eprintln!("[LynShred] add_file falló: {}", e),
+                }
+            }
+        }
+        Ok(all_added)
+    })
+}
+
 #[tauri::command]
 pub fn remove_selected(state: State<AppState>, indices: Vec<usize>) -> Result<(), String> {
     let mut guard = state.file_paths.lock().map_err(|e| e.to_string())?;

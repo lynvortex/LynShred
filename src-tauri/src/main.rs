@@ -8,6 +8,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::add_files,
             commands::add_folder,
+            commands::add_dropped_paths,
             commands::remove_selected,
             commands::clear_list,
             commands::start_shredding,

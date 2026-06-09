@@ -1,4 +1,4 @@
-# LynShred 2.0.0
+# LynShred 2.1.1
 
 LynShred 是一款基于 **Tauri + Rust** 的图形化文件安全粉碎工具，提供可靠的物理级文件覆写删除功能。
 
@@ -35,7 +35,7 @@ LynShred 是一款基于 **Tauri + Rust** 的图形化文件安全粉碎工具�
 ## 项目结构
 
 ```
-LynShred 2.0.0/
+LynShred 2.1.1/
 ├── crates/
 │   └── shred-core/           # 核心擦除库
 │       ├── Cargo.toml
