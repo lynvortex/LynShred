@@ -1,8 +1,8 @@
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
@@ -209,19 +209,65 @@ fn sync_parent_dir(path: &Path) {
 /// Rename file to a random name before deletion to break hard-link associations
 fn rename_before_delete(path: &Path) -> Result<(), ShredError> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let mut buf = [0u8; 8];
-    for _ in 0..3 {
-        OsRng.fill_bytes(&mut buf);
-        let name = hex::encode(buf) + ".del";
-        let np = dir.join(&name);
-        if fs::rename(path, &np).is_ok() {
-            fs::remove_file(&np)?;
-            sync_parent_dir(&np);
-            return Ok(());
-        }
+    let np = random_sibling_path(dir);
+    if fs::rename(path, &np).is_ok() {
+        fs::remove_file(&np)?;
+        sync_parent_dir(&np);
+        return Ok(());
     }
     fs::remove_file(path)?;
     sync_parent_dir(path);
+    Ok(())
+}
+
+fn random_sibling_path(dir: &Path) -> PathBuf {
+    let mut buf = [0u8; 8];
+    OsRng.fill_bytes(&mut buf);
+    dir.join(hex::encode(buf) + ".del")
+}
+
+/// 连续随机重命名：每次重命名都会就地覆写目录项中的文件名，
+/// 降低 MFT/目录索引中残留原文件名的取证痕迹。已打开的句柄不受影响。
+fn scrub_filename(path: &Path, rounds: usize) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..rounds {
+        let dir = current.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let np = random_sibling_path(&dir);
+        if fs::rename(&current, &np).is_ok() {
+            current = np;
+        } else {
+            break;
+        }
+    }
+    current
+}
+
+/// 覆写后读回验证：确认确定性图案确实落盘
+fn verify_pass(
+    file: &mut std::fs::File,
+    pattern: &Pattern,
+    target: usize,
+) -> Result<(), ShredError> {
+    let expected = match pattern {
+        Pattern::Zeros => 0x00,
+        Pattern::Ones => 0xFF,
+        Pattern::Byte(b) => *b,
+        Pattern::Random => return Ok(()),
+    };
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut read = 0usize;
+    while read < target {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Err(ShredError::Other("覆写验证失败：文件长度意外变化".into()));
+        }
+        if buf[..n].iter().any(|&b| b != expected) {
+            return Err(ShredError::Other("覆写验证失败：数据未完全写入磁盘".into()));
+        }
+        read += n;
+    }
     Ok(())
 }
 
@@ -236,8 +282,10 @@ fn shred_one_file(
     // Strip special attributes (read-only, hidden, system) before proceeding
     strip_file_attributes(path)?;
 
-    // Open file first, then check metadata (TOCTOU mitigation)
+    // Open file first, then check metadata (TOCTOU mitigation).
+    // read+write：读回验证需要用同一句柄读取已写入的数据
     let mut file = OpenOptions::new()
+        .read(true)
         .write(true)
         .truncate(false)
         .open(path)
@@ -262,6 +310,11 @@ fn shred_one_file(
 
     // Wipe alternate data streams (Windows NTFS)
     wipe_alternate_data_streams(path)?;
+
+    // 连续随机重命名，冲刷目录项中的原文件名；句柄仍指向同一文件
+    let current_path = scrub_filename(path, 3);
+
+    let mut verified = false;
 
     for (pass_idx, pattern) in patterns.iter().enumerate() {
         if cancel_flag.load(Ordering::SeqCst) {
@@ -290,6 +343,12 @@ fn shred_one_file(
 
         file.sync_all()?;
 
+        // 首个确定性趟读回验证，确认覆写确实落盘
+        if !verified && matches!(pattern, Pattern::Zeros | Pattern::Ones | Pattern::Byte(_)) {
+            verify_pass(&mut file, pattern, write_target)?;
+            verified = true;
+        }
+
         *accumulated += write_target as u64;
         let pct = if total_byte_passes > 0 {
             ((*accumulated * 100) / total_byte_passes) as usize
@@ -305,7 +364,7 @@ fn shred_one_file(
     drop(file);
 
     // Rename to random name before deletion to mitigate directory-entry forensics
-    rename_before_delete(path)?;
+    rename_before_delete(&current_path)?;
 
     Ok(())
 }

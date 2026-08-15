@@ -42,12 +42,58 @@ fn catch<R, F: FnOnce() -> Result<R, String>>(label: &str, f: F) -> Result<R, St
 
 // ── Non-locking helpers (called inside catch) ──
 
+/// 文件列表硬上限，防止枚举超大目录时内存与 UI 不可控
+const MAX_FILE_LIST: usize = 50_000;
+
+/// Windows 系统关键目录，禁止加入粉碎列表
+#[cfg(windows)]
+fn system_critical_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "ALLUSERSPROFILE"] {
+        if let Ok(p) = std::env::var(var) {
+            if !p.is_empty() {
+                dirs.push(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    dirs
+}
+
+#[cfg(not(windows))]
+fn system_critical_dirs() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// 判断 path 是否位于 dir 之下（大小写不敏感的前缀比较，按路径组件逐段匹配）
+fn is_under(path: &Path, dir: &Path) -> bool {
+    let mut pc = path.components();
+    let mut dc = dir.components();
+    loop {
+        match (dc.next(), pc.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(d), Some(p)) => {
+                if !d.as_os_str().eq_ignore_ascii_case(p.as_os_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+fn is_system_critical(path: &Path) -> bool {
+    system_critical_dirs().iter().any(|d| is_under(path, d))
+}
+
 fn add_files_inner(guard: &mut Vec<String>, files: &[String]) -> Result<Vec<String>, String> {
     let mut added = Vec::new();
     for f in files {
         let abs = std::fs::canonicalize(f).unwrap_or_else(|_| Path::new(f).to_path_buf());
+        if is_system_critical(&abs) {
+            continue;
+        }
         let abs_str = abs.to_string_lossy().to_string();
-        if !guard.contains(&abs_str) && abs.is_file() {
+        if !guard.contains(&abs_str) && abs.is_file() && guard.len() < MAX_FILE_LIST {
             guard.push(abs_str.clone());
             added.push(abs_str);
         }
@@ -59,25 +105,32 @@ fn add_folder_inner(guard: &mut Vec<String>, folder: &str) -> Result<Vec<String>
     let mut added = Vec::new();
     let root = Path::new(folder);
     if root.is_dir() {
-        for entry in walkdir_files(root).map_err(|e| e.to_string())? {
-            let abs_str = entry.to_string_lossy().to_string();
-            if !guard.contains(&abs_str) {
+        walkdir_files(root, &mut |path: &Path| {
+            if guard.len() >= MAX_FILE_LIST {
+                return false;
+            }
+            let abs_str = path.to_string_lossy().to_string();
+            if !guard.contains(&abs_str) && !is_system_critical(path) {
                 guard.push(abs_str.clone());
                 added.push(abs_str);
             }
-        }
+            true
+        })
+        .map_err(|e| e.to_string())?;
     }
     Ok(added)
 }
 
-fn walkdir_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
-    let mut files = Vec::new();
-    let mut dirs = vec![dir.to_path_buf()];
-    let mut depth = 0usize;
-    let max_depth = 64;
+/// 流式遍历目录树，每发现一个文件调用一次回调；回调返回 false 时提前终止。
+/// 跳过符号链接/junction，防止遍历越出所选目录；按真实嵌套深度限制 64 层。
+fn walkdir_files<F>(dir: &Path, cb: &mut F) -> Result<(), String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    let max_depth = 64usize;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
 
-    while let Some(current) = dirs.pop() {
-        depth += 1;
+    while let Some((current, depth)) = stack.pop() {
         if depth > max_depth {
             return Err("目录嵌套过深，已超过 64 层限制".into());
         }
@@ -91,14 +144,22 @@ fn walkdir_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 Err(_) => continue,
             };
             let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.is_file() {
-                files.push(path);
+            let ftype = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ftype.is_symlink() {
+                continue;
+            } else if ftype.is_dir() {
+                stack.push((path, depth + 1));
+            } else if ftype.is_file() {
+                if !cb(&path) {
+                    return Ok(());
+                }
             }
         }
     }
-    Ok(files)
+    Ok(())
 }
 
 // ── Tauri Commands ──
@@ -158,6 +219,7 @@ pub fn remove_selected(state: State<AppState>, indices: Vec<usize>) -> Result<()
     catch("remove_selected", || {
         let mut sorted = indices;
         sorted.sort_unstable_by(|a, b| b.cmp(a));
+        sorted.dedup();
         for i in sorted {
             if i < guard.len() {
                 guard.remove(i);
@@ -202,6 +264,13 @@ pub fn start_shredding(
         guard.clone()
     };
 
+    // 粉碎前最终防线：拒绝系统关键目录下的任何路径
+    if let Some(offender) = paths.iter().map(|p| p.as_str()).find(|p| is_system_critical(Path::new(p))) {
+        let mut in_progress = state.shredding_in_progress.lock().map_err(|e| e.to_string())?;
+        *in_progress = false;
+        return Err(format!("列表中包含系统关键路径，已拒绝执行: {}", offender));
+    }
+
     // Create a shared cancel flag
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -221,9 +290,13 @@ pub fn start_shredding(
             }));
         };
 
-        let result = wipe::shred_files(
-            &paths, method_index, &cancel_clone, Some(&progress_cb),
-        );
+        // 捕获工作线程 panic，确保 shredding_in_progress 总能被复位
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| {
+            wipe::shred_files(&paths, method_index, &cancel_clone, Some(&progress_cb))
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(shred_core::ShredError::Other("处理线程发生异常".into())),
+        };
 
         let was_cancelled = cancel_clone.load(Ordering::SeqCst);
 

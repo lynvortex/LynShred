@@ -1,13 +1,13 @@
 [package]
-name = "lynshred-rs"
-version = "2.1.1"
+name = "LynShred"
+version = "2.2.1"
 edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = ["shell-open", "dialog-all"] }
+tauri = { version = "1", features = ["dialog-all"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shred-core = { path = "../crates/shred-core" }

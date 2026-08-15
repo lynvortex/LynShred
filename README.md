@@ -1,4 +1,4 @@
-# LynShred 2.1.1
+# LynShred 2.2.1
 
 LynShred 是一款基于 **Tauri + Rust** 的图形化文件安全粉碎工具，提供可靠的物理级文件覆写删除功能。
 
@@ -15,7 +15,8 @@ LynShred 是一款基于 **Tauri + Rust** 的图形化文件安全粉碎工具�
 ### 存储介质检测
 
 - 自动检测文件所在驱动器是否为**固态硬盘（SSD）**
-- 通过 Windows `fsutil volume disktype` 命令无感检测
+- 优先通过 `IOCTL_STORAGE_QUERY_PROPERTY`（Seek Penalty 查询）直接询问卷设备，**无需管理员权限**
+- 查询不支持时回退到 Windows `fsutil volume disktype` 命令（需管理员）
 - 检测到 SSD 时会弹出风险提示，告知用户磨损均衡机制可能导致覆写失效
 
 ### 用户界面
@@ -28,14 +29,24 @@ LynShred 是一款基于 **Tauri + Rust** 的图形化文件安全粉碎工具�
 ### 技术特性
 
 - **异步架构**：粉碎操作在独立线程中运行，界面始终流畅
-- **线程安全**：通过 `AtomicBool` 实现取消标志，无锁竞争
+- **线程安全**：通过 `AtomicBool` 实现取消标志，无锁竞争；工作线程 panic 不会导致应用锁死
 - **强制刷盘**：每遍写入后调用 `sync_all()` 确保数据落盘
+- **读回验证**：首个确定性图案遍写入后读回校验，确认覆写确实落盘
 - **分块写入**：512 KiB 分块，兼顾性能和取消响应速度
+
+### 安全防护 (2.2.1 新增)
+
+- **符号链接防护**：目录递归遍历时跳过符号链接 / NTFS junction，防止越出所选目录误删链接目标
+- **系统目录拦截**：位于 `Windows`、`Program Files`、`ProgramData` 等系统关键目录下的文件会被拒绝加入与执行
+- **文件名冲刷**：覆写前连续 3 次随机重命名，降低原文件名在目录项 / MFT 中的取证残留
+- **NTFS ADS 擦除**：自动枚举并擦除 NTFS 备用数据流
+- **列表上限**：文件列表上限 50,000 条，防止枚举超大目录导致内存失控
+- **攻击面收紧**：禁用未使用的 `shell.open` 能力，CSP 移除 `style-src 'unsafe-inline'`
 
 ## 项目结构
 
 ```
-LynShred 2.1.1/
+LynShred 2.2.1/
 ├── crates/
 │   └── shred-core/           # 核心擦除库
 │       ├── Cargo.toml
@@ -76,7 +87,7 @@ LynShred 2.1.1/
 cargo build --release
 
 # 产物位于
-# target/release/lynshred-rs.exe
+# target/release/LynShred.exe
 ```
 
 ## 使用说明
@@ -95,10 +106,12 @@ cargo build --release
 
 ### 覆写流程
 
-1. 以读写模式 (`r+b`) 打开文件
-2. 按选定算法的模式序列逐遍写入数据
-3. 每遍写入后调用 `sync_all()` 强制刷入物理介质
-4. 全部覆写完毕后调用 `remove_file()` 删除文件
+1. 去除只读 / 隐藏 / 系统属性后，以读写模式 (`r+b`) 打开文件（缓解 TOCTOU）
+2. 枚举并擦除 NTFS 备用数据流 (ADS)
+3. 连续 3 次随机重命名，冲刷目录项中的原文件名
+4. 按选定算法的模式序列逐遍写入数据
+5. 每遍写入后调用 `sync_all()` 强制刷入物理介质；首个确定性遍读回验证
+6. 覆写完毕后再次随机重命名并删除文件，同步父目录
 
 ### SSD 风险说明
 
