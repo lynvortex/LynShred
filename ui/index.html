@@ -10,6 +10,7 @@
     <div id="toolbar">
         <button id="btn-add-files">添加文件</button>
         <button id="btn-add-folder">添加文件夹</button>
+        <button id="btn-add-volume" class="danger">全盘粉碎</button>
         <span class="sep"></span>
         <button id="btn-remove">移除选中</button>
         <button id="btn-clear">清空列表</button>
@@ -21,7 +22,7 @@
                 <path d="M0 0H33L45 12V55H0Z" fill="#a0a0a0"/>
                 <path d="M33 0V12H45Z" fill="#828282"/>
             </svg>
-            <span>将文件拖放至此</span>
+            <span>将文件或文件夹拖放至此</span>
         </div>
     </div>
 
@@ -37,14 +38,59 @@
 
     <!-- 进度对话框 -->
     <div id="overlay" class="hidden"></div>
-    <div id="progress-dialog" class="hidden">
-        <div id="progress-title">处理中</div>
-        <div id="progress-label">正在处理文件，请稍候...</div>
+    <div id="progress-dialog" class="hidden dlg">
+        <div class="dlg-title">处理中</div>
+        <div id="progress-label">正在处理，请稍候...</div>
         <div id="progress-bar-bg">
             <div id="progress-bar-fill"></div>
         </div>
-        <div id="progress-btn-area">
+        <div id="progress-current">&nbsp;</div>
+        <div class="dlg-foot">
             <button id="btn-cancel-progress">取消</button>
+        </div>
+    </div>
+
+    <!-- 全盘粉碎对话框 -->
+    <div id="volume-dialog" class="hidden dlg">
+        <div class="dlg-title">全盘粉碎</div>
+        <div class="dlg-body">
+            <div class="info-box">
+                <div class="info-h">作用范围</div>
+                <p>对所选卷（盘符）根目录执行粉碎，清空该盘上的<strong>全部文件与子目录</strong>（含隐藏文件与系统目录）。卷本身与盘符保留，不格式化，也不改动分区结构。</p>
+
+                <div class="info-h">与「文件夹粉碎」的差异</div>
+                <ul>
+                    <li><strong>文件夹粉碎</strong>：只处理选中的那一个目录树，文件粉碎完再自底向上删除树内所有目录并删除文件夹本身，不留空目录。</li>
+                    <li><strong>全盘粉碎</strong>：以整个卷根为目标，删除该盘全部目录内容，仅保留盘符，可额外覆写整卷空闲空间。</li>
+                    <li>两者都不跟随符号链接 / 目录联接（只删链接条目本身）；被系统占用的文件无法删除，会在结果中逐条列出。</li>
+                </ul>
+
+                <div class="info-h">不可选</div>
+                <p>系统盘，以及本程序当前所在的卷，禁止执行全盘粉碎。</p>
+            </div>
+
+            <div id="volume-list" class="volume-list"></div>
+
+            <label class="chk-line">
+                <input type="checkbox" id="opt-free-space" checked>
+                <span>粉碎完成后覆写卷上的空闲空间（消除此前已删除文件的数据残留，会显著增加耗时）</span>
+            </label>
+        </div>
+        <div class="dlg-foot">
+            <button id="btn-volume-cancel">取消</button>
+            <button id="btn-volume-ok" class="danger" disabled>加入列表</button>
+        </div>
+    </div>
+
+    <!-- 结果对话框 -->
+    <div id="report-dialog" class="hidden dlg">
+        <div class="dlg-title" id="report-title">处理结果</div>
+        <div class="dlg-body">
+            <div id="report-summary"></div>
+            <div id="report-detail"></div>
+        </div>
+        <div class="dlg-foot">
+            <button id="btn-report-ok">关闭</button>
         </div>
     </div>
 

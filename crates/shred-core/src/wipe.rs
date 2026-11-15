@@ -1,14 +1,24 @@
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 use crate::error::ShredError;
 
 const CHUNK_SIZE: usize = 512 * 1024;
+
+/// Windows 文件属性中的「重解析点」标志（符号链接 / 目录联接 / 云占位符等）
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+/// 打开路径时不解析重解析点，直接指向链接对象本身
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Gutmann-style 35-pass pattern sequence
 pub fn gutmann_patterns() -> Vec<Pattern> {
@@ -69,7 +79,16 @@ pub static SHRED_METHODS: LazyLock<[ShredMethod; 3]> = LazyLock::new(|| [
     },
 ]);
 
-pub type ProgressFn = dyn Fn(usize, usize, usize) + Send;
+/// 进度事件：整体百分比 + 文件计数 + 当前处理项
+#[derive(Clone, Debug, Serialize)]
+pub struct ProgressTick {
+    pub percent: usize,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub current: String,
+}
+
+pub type ProgressFn<'a> = dyn Fn(ProgressTick) + Send + 'a;
 
 fn fill_buffer(buf: &mut [u8], pattern: &Pattern) {
     match pattern {
@@ -80,9 +99,10 @@ fn fill_buffer(buf: &mut [u8], pattern: &Pattern) {
     }
 }
 
-/// Strip read-only, hidden, and system attributes on Windows
+/// Strip read-only, hidden, and system attributes on Windows.
+/// 目标已不存在时视为成功（并发删除 / 上一轮已清理）。
 #[cfg(windows)]
-fn strip_file_attributes(path: &Path) -> Result<(), ShredError> {
+pub fn strip_file_attributes(path: &Path) -> Result<(), ShredError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileAttributesW, SetFileAttributesW,
@@ -94,6 +114,11 @@ fn strip_file_attributes(path: &Path) -> Result<(), ShredError> {
 
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if attrs == INVALID_FILE_ATTRIBUTES {
+        let err = io::Error::last_os_error();
+        // ERROR_FILE_NOT_FOUND(2) / ERROR_PATH_NOT_FOUND(3) 说明目标已消失
+        if matches!(err.raw_os_error(), Some(2) | Some(3)) {
+            return Ok(());
+        }
         return Err(ShredError::Other(format!("无法获取文件属性: {}", path.display())));
     }
 
@@ -107,7 +132,7 @@ fn strip_file_attributes(path: &Path) -> Result<(), ShredError> {
 }
 
 #[cfg(not(windows))]
-fn strip_file_attributes(_path: &Path) -> Result<(), ShredError> {
+pub fn strip_file_attributes(_path: &Path) -> Result<(), ShredError> {
     Ok(())
 }
 
@@ -143,7 +168,6 @@ fn wipe_alternate_data_streams(path: &Path) -> Result<(), ShredError> {
     loop {
         let name_len = stream_data.cStreamName.len();
         if name_len > 0 {
-            // Find null terminator
             let effective_len = stream_data.cStreamName.iter()
                 .position(|&c| c == 0)
                 .unwrap_or(name_len);
@@ -174,14 +198,16 @@ fn wipe_alternate_data_streams(path: &Path) -> Result<(), ShredError> {
         let mut stream_path = path.as_os_str().to_os_string();
         stream_path.push(stream_name);
 
-        if let Ok(f) = OpenOptions::new().write(true).truncate(false).open(&stream_path) {
+        if let Ok(mut f) = OpenOptions::new().write(true).truncate(false).open(&stream_path) {
             if let Ok(meta) = f.metadata() {
-                let size = meta.len() as usize;
+                let size = meta.len();
                 if size > 0 {
-                    let mut buf = vec![0u8; std::cmp::min(CHUNK_SIZE, size)];
+                    // 只写流自身的长度，避免把短流扩展成整块缓冲区大小
+                    let n = std::cmp::min(CHUNK_SIZE as u64, size) as usize;
+                    let mut buf = vec![0u8; n];
                     OsRng.fill_bytes(&mut buf);
-                    let _ = (&f).seek(SeekFrom::Start(0));
-                    let _ = (&f).write_all(&buf);
+                    let _ = f.seek(SeekFrom::Start(0));
+                    let _ = f.write_all(&buf);
                     let _ = f.sync_all();
                 }
             }
@@ -204,20 +230,6 @@ fn sync_parent_dir(path: &Path) {
             drop(f);
         }
     }
-}
-
-/// Rename file to a random name before deletion to break hard-link associations
-fn rename_before_delete(path: &Path) -> Result<(), ShredError> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let np = random_sibling_path(dir);
-    if fs::rename(path, &np).is_ok() {
-        fs::remove_file(&np)?;
-        sync_parent_dir(&np);
-        return Ok(());
-    }
-    fs::remove_file(path)?;
-    sync_parent_dir(path);
-    Ok(())
 }
 
 fn random_sibling_path(dir: &Path) -> PathBuf {
@@ -246,7 +258,7 @@ fn scrub_filename(path: &Path, rounds: usize) -> PathBuf {
 fn verify_pass(
     file: &mut std::fs::File,
     pattern: &Pattern,
-    target: usize,
+    target: u64,
 ) -> Result<(), ShredError> {
     let expected = match pattern {
         Pattern::Zeros => 0x00,
@@ -257,7 +269,7 @@ fn verify_pass(
 
     file.seek(SeekFrom::Start(0))?;
     let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut read = 0usize;
+    let mut read: u64 = 0;
     while read < target {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -266,182 +278,197 @@ fn verify_pass(
         if buf[..n].iter().any(|&b| b != expected) {
             return Err(ShredError::Other("覆写验证失败：数据未完全写入磁盘".into()));
         }
-        read += n;
+        read += n as u64;
     }
     Ok(())
 }
 
-fn shred_one_file(
-    path: &Path,
-    patterns: &[Pattern],
+/// 一次粉碎会话：持有算法、累计进度与取消标志，可对任意多个文件反复调用。
+/// 目录树遍历（`tree::shred_tree`）通过闭包把每个文件喂进这里。
+pub struct Session<'a> {
+    patterns: &'a [Pattern],
     total_byte_passes: u64,
-    accumulated: &mut u64,
-    cancel_flag: &AtomicBool,
-    progress_cb: Option<&ProgressFn>,
-) -> Result<(), ShredError> {
-    // Strip special attributes (read-only, hidden, system) before proceeding
-    strip_file_attributes(path)?;
+    accumulated: u64,
+    files_total: usize,
+    files_done: usize,
+    cancel: &'a AtomicBool,
+    progress: Option<&'a ProgressFn<'a>>,
+}
 
-    // Open file first, then check metadata (TOCTOU mitigation).
-    // read+write：读回验证需要用同一句柄读取已写入的数据
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied {
-                ShredError::Permission(format!("{}", path.display()))
-            } else {
-                ShredError::Io(e)
-            }
-        })?;
-
-    let file_size = file.metadata().map_err(ShredError::Io)?.len() as usize;
-
-    if file_size == 0 {
-        drop(file);
-        fs::remove_file(path)?;
-        *accumulated += 0;
-        return Ok(());
+impl<'a> Session<'a> {
+    pub fn new(
+        method_index: usize,
+        total_bytes: u64,
+        files_total: usize,
+        cancel: &'a AtomicBool,
+        progress: Option<&'a ProgressFn<'a>>,
+    ) -> Result<Self, ShredError> {
+        let method = SHRED_METHODS
+            .get(method_index)
+            .ok_or_else(|| ShredError::Other("无效的擦除算法".into()))?;
+        Ok(Self {
+            patterns: &method.patterns,
+            total_byte_passes: total_bytes.saturating_mul(method.patterns.len() as u64),
+            accumulated: 0,
+            files_total,
+            files_done: 0,
+            cancel,
+            progress,
+        })
     }
 
-    let total_passes = patterns.len();
-
-    // Wipe alternate data streams (Windows NTFS)
-    wipe_alternate_data_streams(path)?;
-
-    // 连续随机重命名，冲刷目录项中的原文件名；句柄仍指向同一文件
-    let current_path = scrub_filename(path, 3);
-
-    let mut verified = false;
-
-    for (pass_idx, pattern) in patterns.iter().enumerate() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err(ShredError::Cancelled);
-        }
-
-        // Re-check file size each pass — catch appended data
-        let current_size = file.metadata().map_err(ShredError::Io)?.len() as usize;
-        let write_target = current_size.max(file_size);
-
-        let mut written = 0usize;
-        while written < write_target {
-            if cancel_flag.load(Ordering::SeqCst) {
-                return Err(ShredError::Cancelled);
-            }
-
-            let remaining = write_target - written;
-            let write_size = std::cmp::min(CHUNK_SIZE, remaining);
-            let mut buf = vec![0u8; write_size];
-            fill_buffer(&mut buf, pattern);
-
-            file.seek(SeekFrom::Start(written as u64))?;
-            file.write_all(&buf)?;
-            written += write_size;
-        }
-
-        file.sync_all()?;
-
-        // 首个确定性趟读回验证，确认覆写确实落盘
-        if !verified && matches!(pattern, Pattern::Zeros | Pattern::Ones | Pattern::Byte(_)) {
-            verify_pass(&mut file, pattern, write_target)?;
-            verified = true;
-        }
-
-        *accumulated += write_target as u64;
-        let pct = if total_byte_passes > 0 {
-            ((*accumulated * 100) / total_byte_passes) as usize
+    fn percent(&self) -> usize {
+        if self.total_byte_passes > 0 {
+            ((self.accumulated.saturating_mul(100)) / self.total_byte_passes) as usize
+        } else if self.files_total > 0 {
+            (self.files_done.saturating_mul(100)) / self.files_total
         } else {
             100
+        }
+    }
+
+    fn tick(&self, current: &Path) {
+        if let Some(cb) = self.progress {
+            cb(ProgressTick {
+                percent: self.percent().min(100),
+                files_done: self.files_done,
+                files_total: self.files_total,
+                current: current.display().to_string(),
+            });
+        }
+    }
+
+    /// 粉碎单个文件，返回其原始大小（字节）。
+    /// 文件已不存在时视为成功并返回 0。
+    pub fn shred(&mut self, path: &Path) -> Result<u64, ShredError> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(ShredError::Cancelled);
+        }
+        let result = self.shred_inner(path);
+        self.files_done += 1;
+        self.tick(path);
+        result
+    }
+
+    fn shred_inner(&mut self, path: &Path) -> Result<u64, ShredError> {
+        // Strip special attributes (read-only, hidden, system) before proceeding
+        strip_file_attributes(path)?;
+
+        // Open file first, then check metadata (TOCTOU mitigation).
+        // read+write：读回验证需要用同一句柄读取已写入的数据
+        // FILE_FLAG_OPEN_REPARSE_POINT：即使路径在遍历后被替换为链接，也只打开链接本身，
+        // 绝不跟随到链接目标，避免覆写落到用户所选范围之外。
+        let mut builder = OpenOptions::new();
+        builder.read(true).write(true).truncate(false);
+        #[cfg(windows)]
+        builder.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+        let mut file = match builder.open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(if e.kind() == io::ErrorKind::PermissionDenied {
+                    ShredError::Permission(format!("{}", path.display()))
+                } else {
+                    ShredError::Io(e)
+                })
+            }
         };
 
-        if let Some(cb) = progress_cb {
-            cb(pass_idx + 1, total_passes, pct.min(100));
-        }
-    }
-
-    drop(file);
-
-    // Rename to random name before deletion to mitigate directory-entry forensics
-    rename_before_delete(&current_path)?;
-
-    Ok(())
-}
-
-/// Shred multiple files using the specified method.
-/// Progress callback receives (current_pass, total_passes, overall_percent).
-/// Returns a list of successfully shredded file paths.
-pub fn shred_files(
-    paths: &[String],
-    method_index: usize,
-    cancel_flag: &AtomicBool,
-    progress_cb: Option<&ProgressFn>,
-) -> Result<Vec<String>, ShredError> {
-    if paths.is_empty() {
-        return Err(ShredError::Other("没有文件需要处理".into()));
-    }
-
-    if method_index >= SHRED_METHODS.len() {
-        return Err(ShredError::Other("无效的擦除算法".into()));
-    }
-
-    let method = &SHRED_METHODS[method_index];
-    let patterns = &method.patterns;
-
-    let mut total_byte_passes = 0u64;
-    let mut valid_paths: Vec<&str> = Vec::new();
-    for p in paths {
-        let path = Path::new(p);
-        if path.is_file() {
-            if let Ok(meta) = path.metadata() {
-                total_byte_passes += meta.len() * patterns.len() as u64;
+        let meta = file.metadata().map_err(ShredError::Io)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                drop(file);
+                return Err(ShredError::Other(format!(
+                    "{} 是符号链接或目录联接，已拒绝跟随",
+                    path.display()
+                )));
             }
-            valid_paths.push(p.as_str());
         }
-    }
+        let file_size = meta.len();
 
-    if valid_paths.is_empty() {
-        return Err(ShredError::Other("未找到可处理的有效文件".into()));
-    }
-
-    if total_byte_passes == 0 {
-        for p in &valid_paths {
-            let _ = fs::remove_file(p);
+        if file_size == 0 {
+            drop(file);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ShredError::Io(e)),
+            }
+            sync_parent_dir(path);
+            return Ok(0);
         }
-        return Ok(valid_paths.into_iter().map(String::from).collect());
-    }
 
-    let mut accumulated = 0u64;
-    let mut shredded: Vec<String> = Vec::new();
+        // Wipe alternate data streams (Windows NTFS)
+        wipe_alternate_data_streams(path)?;
 
-    for file_path in &valid_paths {
-        if cancel_flag.load(Ordering::SeqCst) {
-            // Return partial results — some files were already shredded
-            if shredded.is_empty() {
+        // 连续随机重命名，冲刷目录项中的原文件名；句柄仍指向同一文件
+        let current_path = scrub_filename(path, 3);
+
+        let patterns = self.patterns;
+        let mut verified = false;
+
+        for pattern in patterns.iter() {
+            if self.cancel.load(Ordering::SeqCst) {
                 return Err(ShredError::Cancelled);
             }
-            return Ok(shredded);
-        }
 
-        let path = Path::new(file_path);
-        match shred_one_file(path, patterns, total_byte_passes, &mut accumulated, cancel_flag, progress_cb) {
-            Ok(()) => {
-                shredded.push(file_path.to_string());
-            }
-            Err(e) => {
-                // Return what was successfully shredded so far, plus the error
-                if shredded.is_empty() {
-                    return Err(e);
+            // Re-check file size each pass — catch appended data
+            let current_size = file.metadata().map_err(ShredError::Io)?.len();
+            let write_target = current_size.max(file_size);
+
+            let mut written: u64 = 0;
+            while written < write_target {
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(ShredError::Cancelled);
                 }
-                // Partial success — return shredded list; caller can check len vs valid_paths
-                shredded.push(file_path.to_string());
-                return Err(e);
+
+                let remaining = write_target - written;
+                let write_size = std::cmp::min(CHUNK_SIZE as u64, remaining) as usize;
+                let mut buf = vec![0u8; write_size];
+                fill_buffer(&mut buf, pattern);
+
+                file.seek(SeekFrom::Start(written))?;
+                file.write_all(&buf)?;
+                written += write_size as u64;
+            }
+
+            file.sync_all()?;
+
+            // 首个确定性趟读回验证，确认覆写确实落盘
+            if !verified && matches!(pattern, Pattern::Zeros | Pattern::Ones | Pattern::Byte(_)) {
+                verify_pass(&mut file, pattern, write_target)?;
+                verified = true;
+            }
+
+            self.accumulated += write_target;
+            self.tick(path);
+        }
+
+        drop(file);
+
+        // Rename to random name before deletion to mitigate directory-entry forensics
+        let dir = current_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let renamed = random_sibling_path(&dir);
+        match fs::rename(&current_path, &renamed) {
+            Ok(()) => {
+                fs::remove_file(&renamed)?;
+                sync_parent_dir(&renamed);
+            }
+            Err(_) => {
+                match fs::remove_file(&current_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(ShredError::Io(e)),
+                }
+                sync_parent_dir(&current_path);
             }
         }
-    }
 
-    Ok(shredded)
+        Ok(file_size)
+    }
 }
 
 #[cfg(test)]
@@ -456,16 +483,39 @@ mod tests {
 
     #[test]
     fn test_shred_empty_file() -> Result<(), ShredError> {
+        use crate::tree::shred_tree;
+
         let dir = std::env::temp_dir().join("shred_test_empty");
-        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
         let file_path = dir.join("empty.txt");
         fs::write(&file_path, b"")?;
 
         let cancel = AtomicBool::new(false);
-        let paths = vec![file_path.to_string_lossy().to_string()];
-        let result = shred_files(&paths, 0, &cancel, None)?;
-        assert_eq!(result.len(), 1);
+        let mut session = Session::new(0, 0, 1, &cancel, None)?;
+        let report = shred_tree(&dir, true, &cancel, &mut |p: &Path| session.shred(p)).unwrap();
+
+        assert_eq!(report.files_shredded, 1);
+        assert!(report.residual.is_empty(), "{:?}", report.residual);
+        assert!(!dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_shred_regular_file_removed() -> Result<(), ShredError> {
+        let dir = std::env::temp_dir().join("shred_test_regular");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let file_path = dir.join("data.bin");
+        fs::write(&file_path, vec![0x41u8; 200_000])?;
+
+        let cancel = AtomicBool::new(false);
+        let mut session = Session::new(0, 200_000, 1, &cancel, None)?;
+        let bytes = session.shred(&file_path)?;
+
+        assert_eq!(bytes, 200_000);
         assert!(!file_path.exists());
+        assert_eq!(fs::read_dir(&dir)?.count(), 0, "不应留下临时残留文件");
         fs::remove_dir(&dir).ok();
         Ok(())
     }

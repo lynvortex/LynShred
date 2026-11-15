@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod sysdir;
 
 fn main() {
     tauri::Builder::default()
@@ -9,6 +10,8 @@ fn main() {
             commands::add_files,
             commands::add_folder,
             commands::add_dropped_paths,
+            commands::add_volumes,
+            commands::list_volumes,
             commands::remove_selected,
             commands::clear_list,
             commands::start_shredding,

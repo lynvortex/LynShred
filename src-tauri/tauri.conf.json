@@ -8,18 +8,16 @@
   },
   "package": {
     "productName": "LynShred",
-    "version": "2.2.1"
+    "version": "2.3.0"
   },
   "tauri": {
     "allowlist": {
       "all": false,
       "dialog": {
-        "all": true,
         "ask": true,
         "confirm": true,
         "message": true,
-        "open": true,
-        "save": true
+        "open": true
       },
       "shell": {
         "open": false
@@ -49,17 +47,17 @@
       ]
     },
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
     },
     "windows": [
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LynShred 2.2.1",
-        "width": 650,
-        "height": 550,
-        "minWidth": 550,
-        "minHeight": 450
+        "title": "LynShred 2.3.0",
+        "width": 800,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 500
       }
     ]
   }

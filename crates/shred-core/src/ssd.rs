@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 /// Check if the drive containing the given path is an SSD (Windows only).
 /// Primary method: IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceSeekPenaltyProperty)
@@ -122,12 +124,31 @@ fn volume_is_ssd(_drive: &str) -> Option<bool> {
     None
 }
 
+/// 通过 `GetSystemDirectoryW` 取系统目录，拼接 `fsutil.exe` 的绝对路径。
+/// 绝不按 PATH 查找——否则 PATH 中同名的可执行文件会被优先调用（CWE-426）。
+#[cfg(windows)]
+fn fsutil_path() -> Option<PathBuf> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buf = vec![0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    let dir = String::from_utf16_lossy(&buf[..n]);
+    Some(PathBuf::from(format!("{}\\fsutil.exe", dir)))
+}
+
 /// Fallback: `fsutil volume disktype <drive>`. Requires administrator.
 #[cfg(windows)]
 fn fsutil_is_ssd(drive: &str) -> bool {
     use std::os::windows::process::CommandExt;
 
-    std::process::Command::new("fsutil")
+    let Some(exe) = fsutil_path() else {
+        return false;
+    };
+
+    std::process::Command::new(exe)
         .args(["volume", "disktype", drive])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
